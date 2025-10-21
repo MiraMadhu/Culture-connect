@@ -1,0 +1,298 @@
+from flask import Blueprint, render_template, request, redirect, url_for, flash, jsonify
+from flask_login import login_required, current_user
+from models import db, Post, Comment, Category, Group, Message, JobPosting, User
+from datetime import datetime
+
+main_bp = Blueprint('main', __name__)
+
+# ==================== HOME & DASHBOARD ====================
+@main_bp.route('/')
+def home():
+    categories = Category.query.all()
+    posts = Post.query.order_by(Post.created_at.desc()).limit(10).all()
+    groups = Group.query.limit(6).all()
+    return render_template('home.html', categories=categories, posts=posts, groups=groups)
+
+@main_bp.route('/dashboard')
+@login_required
+def dashboard():
+    user_posts = Post.query.filter_by(user_id=current_user.id).count()
+    user_comments = Comment.query.filter_by(user_id=current_user.id).count()
+    user_groups = current_user.groups.count()
+    recent_posts = Post.query.filter_by(user_id=current_user.id).order_by(Post.created_at.desc()).limit(5).all()
+    
+    return render_template('dashboard.html', 
+                         user_posts=user_posts,
+                         user_comments=user_comments,
+                         user_groups=user_groups,
+                         recent_posts=recent_posts)
+
+# ==================== FORUM ROUTES ====================
+@main_bp.route('/forum')
+def forum():
+    page = request.args.get('page', 1, type=int)
+    category_id = request.args.get('category', type=int)
+    
+    query = Post.query
+    if category_id:
+        query = query.filter_by(category_id=category_id)
+    
+    posts = query.order_by(Post.created_at.desc()).paginate(page=page, per_page=10)
+    categories = Category.query.all()
+    
+    return render_template('forum.html', posts=posts, categories=categories, selected_category=category_id)
+
+@main_bp.route('/post/create', methods=['GET', 'POST'])
+@login_required
+def create_post():
+    categories = Category.query.all()
+    
+    if request.method == 'POST':
+        title = request.form.get('title')
+        content = request.form.get('content')
+        category_id = request.form.get('category_id')
+        
+        if not title or not content or not category_id:
+            flash('All fields are required', 'danger')
+            return redirect(url_for('main.create_post'))
+        
+        post = Post(title=title, content=content, user_id=current_user.id, category_id=category_id)
+        db.session.add(post)
+        db.session.commit()
+        
+        flash('Post created successfully!', 'success')
+        return redirect(url_for('main.view_post', post_id=post.id))
+    
+    return render_template('create_post.html', categories=categories)
+
+@main_bp.route('/post/<int:post_id>', methods=['GET', 'POST'])
+def view_post(post_id):
+    post = Post.query.get_or_404(post_id)
+    post.views += 1
+    db.session.commit()
+    
+    if request.method == 'POST':
+        if not current_user.is_authenticated:
+            flash('You must be logged in to comment', 'warning')
+            return redirect(url_for('auth.login'))
+        
+        content = request.form.get('content')
+        if content:
+            comment = Comment(content=content, user_id=current_user.id, post_id=post_id)
+            db.session.add(comment)
+            db.session.commit()
+            flash('Comment added!', 'success')
+            return redirect(url_for('main.view_post', post_id=post_id))
+    
+    comments = Comment.query.filter_by(post_id=post_id).order_by(Comment.created_at.desc()).all()
+    return render_template('view_post.html', post=post, comments=comments)
+
+@main_bp.route('/post/<int:post_id>/edit', methods=['GET', 'POST'])
+@login_required
+def edit_post(post_id):
+    post = Post.query.get_or_404(post_id)
+    
+    if post.author.id != current_user.id and not current_user.is_admin:
+        flash('You do not have permission to edit this post', 'danger')
+        return redirect(url_for('main.view_post', post_id=post_id))
+    
+    categories = Category.query.all()
+    
+    if request.method == 'POST':
+        post.title = request.form.get('title')
+        post.content = request.form.get('content')
+        post.category_id = request.form.get('category_id')
+        post.updated_at = datetime.utcnow()
+        db.session.commit()
+        
+        flash('Post updated successfully!', 'success')
+        return redirect(url_for('main.view_post', post_id=post_id))
+    
+    return render_template('edit_post.html', post=post, categories=categories)
+
+@main_bp.route('/post/<int:post_id>/delete', methods=['POST'])
+@login_required
+def delete_post(post_id):
+    post = Post.query.get_or_404(post_id)
+    
+    if post.author.id != current_user.id and not current_user.is_admin:
+        flash('You do not have permission to delete this post', 'danger')
+        return redirect(url_for('main.view_post', post_id=post_id))
+    
+    db.session.delete(post)
+    db.session.commit()
+    
+    flash('Post deleted successfully!', 'success')
+    return redirect(url_for('main.forum'))
+
+# ==================== GROUP CHAT ROUTES ====================
+@main_bp.route('/groups')
+def groups():
+    page = request.args.get('page', 1, type=int)
+    search = request.args.get('search', '')
+    
+    query = Group.query
+    if search:
+        query = query.filter(Group.name.ilike(f'%{search}%'))
+    
+    groups = query.order_by(Group.created_at.desc()).paginate(page=page, per_page=12)
+    return render_template('groups.html', groups=groups, search=search)
+
+@main_bp.route('/group/create', methods=['GET', 'POST'])
+@login_required
+def create_group():
+    if request.method == 'POST':
+        name = request.form.get('name')
+        description = request.form.get('description')
+        country = request.form.get('country')
+        language = request.form.get('language')
+        
+        if not name:
+            flash('Group name is required', 'danger')
+            return redirect(url_for('main.create_group'))
+        
+        group = Group(name=name, description=description, country=country, 
+                     language=language, creator_id=current_user.id)
+        group.members.append(current_user)
+        group.moderators.append(current_user)
+        db.session.add(group)
+        db.session.commit()
+        
+        flash('Group created successfully!', 'success')
+        return redirect(url_for('main.view_group', group_id=group.id))
+    
+    return render_template('create_group.html')
+
+@main_bp.route('/group/<int:group_id>')
+def view_group(group_id):
+    group = Group.query.get_or_404(group_id)
+    messages = Message.query.filter_by(group_id=group_id).order_by(Message.created_at.desc()).limit(50).all()
+    messages.reverse()
+    
+    is_member = current_user in group.members if current_user.is_authenticated else False
+    
+    return render_template('view_group.html', group=group, messages=messages, is_member=is_member)
+
+@main_bp.route('/group/<int:group_id>/join', methods=['POST'])
+@login_required
+def join_group(group_id):
+    group = Group.query.get_or_404(group_id)
+    
+    if current_user not in group.members:
+        group.members.append(current_user)
+        db.session.commit()
+        flash(f'You joined {group.name}!', 'success')
+    else:
+        flash('You are already a member of this group', 'info')
+    
+    return redirect(url_for('main.view_group', group_id=group_id))
+
+@main_bp.route('/group/<int:group_id>/leave', methods=['POST'])
+@login_required
+def leave_group(group_id):
+    group = Group.query.get_or_404(group_id)
+    
+    if current_user in group.members:
+        group.members.remove(current_user)
+        db.session.commit()
+        flash(f'You left {group.name}', 'success')
+    
+    return redirect(url_for('main.groups'))
+
+@main_bp.route('/group/<int:group_id>/message', methods=['POST'])
+@login_required
+def send_message(group_id):
+    group = Group.query.get_or_404(group_id)
+    
+    if current_user not in group.members:
+        return jsonify({'error': 'Not a member'}), 403
+    
+    content = request.form.get('content')
+    if content:
+        message = Message(content=content, user_id=current_user.id, group_id=group_id)
+        db.session.add(message)
+        db.session.commit()
+        flash('Message sent!', 'success')
+    
+    return redirect(url_for('main.view_group', group_id=group_id))
+
+# ==================== USER PROFILE ROUTES ====================
+@main_bp.route('/profile/<username>')
+def profile(username):
+    user = User.query.filter_by(username=username).first_or_404()
+    posts = Post.query.filter_by(user_id=user.id).order_by(Post.created_at.desc()).all()
+    
+    return render_template('profile.html', user=user, posts=posts)
+
+@main_bp.route('/profile/edit', methods=['GET', 'POST'])
+@login_required
+def edit_profile():
+    if request.method == 'POST':
+        current_user.bio = request.form.get('bio', '')
+        current_user.country = request.form.get('country', '')
+        current_user.languages = request.form.get('languages', '')
+        db.session.commit()
+        
+        flash('Profile updated successfully!', 'success')
+        return redirect(url_for('main.profile', username=current_user.username))
+    
+    return render_template('edit_profile.html')
+
+# ==================== JOB ROUTES ====================
+@main_bp.route('/jobs')
+def jobs():
+    page = request.args.get('page', 1, type=int)
+    job_type = request.args.get('type', '')
+    
+    query = JobPosting.query
+    if job_type:
+        query = query.filter_by(job_type=job_type)
+    
+    jobs = query.order_by(JobPosting.created_at.desc()).paginate(page=page, per_page=10)
+    return render_template('jobs.html', jobs=jobs, selected_type=job_type)
+
+@main_bp.route('/job/create', methods=['GET', 'POST'])
+@login_required
+def create_job():
+    if request.method == 'POST':
+        title = request.form.get('title')
+        description = request.form.get('description')
+        company = request.form.get('company')
+        location = request.form.get('location')
+        salary = request.form.get('salary')
+        job_type = request.form.get('job_type')
+        
+        if not all([title, description, company, location]):
+            flash('All required fields must be filled', 'danger')
+            return redirect(url_for('main.create_job'))
+        
+        job = JobPosting(title=title, description=description, company=company,
+                        location=location, salary=salary, job_type=job_type,
+                        user_id=current_user.id)
+        db.session.add(job)
+        db.session.commit()
+        
+        flash('Job posted successfully!', 'success')
+        return redirect(url_for('main.jobs'))
+    
+    return render_template('create_job.html')
+
+@main_bp.route('/job/<int:job_id>')
+def view_job(job_id):
+    job = JobPosting.query.get_or_404(job_id)
+    return render_template('view_job.html', job=job)
+
+@main_bp.route('/job/<int:job_id>/delete', methods=['POST'])
+@login_required
+def delete_job(job_id):
+    job = JobPosting.query.get_or_404(job_id)
+    
+    if job.poster.id != current_user.id and not current_user.is_admin:
+        flash('You do not have permission to delete this job', 'danger')
+        return redirect(url_for('main.view_job', job_id=job_id))
+    
+    db.session.delete(job)
+    db.session.commit()
+    
+    flash('Job deleted successfully!', 'success')
+    return redirect(url_for('main.jobs'))
